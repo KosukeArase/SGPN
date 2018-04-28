@@ -8,7 +8,6 @@
 
 We firstly split the training set into training part and validation part. SGPN is finetuned on a pre-trained semantic segmentation model with large batchsize. For training,
 ```bash
-cd experiments/stanfordindoor
 python train.py 
 ```
 Use the following scripts for testing. `valid.py` is used to compute the per-category theshold for group merging.
