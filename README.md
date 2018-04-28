@@ -23,12 +23,12 @@ Please refer to `data/` for example h5 file and input list file. A pre-trained m
 
 ### Citation
 If you find our work useful, please consider citing:
-	@inproceedings{wang2018sgpn,
-		title={SGPN: Similarity Group Proposal Network for 3D Point Cloud Instance Segmentation},
-		author={Wang, Weiyue and Yu, Ronald and Huang, Qiangui and Neumann, Ulrich},
-		booktitle={CVPR},
-		year={2018}
-	}
+        @inproceedings{wang2018sgpn,
+            title={SGPN: Similarity Group Proposal Network for 3D Point Cloud Instance Segmentation},
+            author={Wang, Weiyue and Yu, Ronald and Huang, Qiangui and Neumann, Ulrich},
+            booktitle={CVPR},
+            year={2018}
+        }
 
 ### Acknowledgemets
 
