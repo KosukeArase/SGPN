@@ -1,7 +1,7 @@
 ### SGPN:Similarity Group Proposal Network for 3D Point Cloud Instance Segmentation [<a href="https://arxiv.org/pdf/1711.08588.pdf">Arxiv</a>]
 
 ### Dependencies
-- `tensorflow` (0.3.0)
+- `tensorflow` (1.3.0)
 - `h5py`
 
 ### Training & Testing 
