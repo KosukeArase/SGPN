@@ -19,7 +19,7 @@ python test.py
 
 ### Data and Model 
 
-Please refer to `data/` for example h5 file and input list file. A pre-trained model can be downloaded [<a href="">here</a>].
+Please refer to `data/` for example h5 file and input list file. A pre-trained model can be downloaded [<a href="https://drive.google.com/file/d/1-e7YCfrLB4zqbFyWfQGe8sm_QFNrr59K/view?usp=sharing">here</a>].
 
 ### Citation
 If you find our work useful, please consider citing:
