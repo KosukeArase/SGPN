@@ -4,6 +4,7 @@ import numpy as np
 import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # see issue #152
 import sys
+import itertools
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 print BASE_DIR
@@ -20,17 +21,17 @@ parser = argparse.ArgumentParser()
 # Experiment Settings
 parser.add_argument('--gpu', type=str, default="1", help='GPU to use [default: GPU 1]')
 parser.add_argument('--wd', type=float, default=0.9, help='Weight Decay [Default: 0.0]')
-parser.add_argument('--epoch', type=int, default=200, help='Number of epochs [default: 50]')
+parser.add_argument('--epoch', type=int, default=200, help='Number of epochs [default: 200]')
 parser.add_argument('--batch', type=int, default=4, help='Batch Size during training [default: 4]')
-parser.add_argument('--point_num', type=int, default=8192, help='Point Number')
-parser.add_argument('--group_num', type=int, default=50, help='Maximum Group Number in one pc')
+parser.add_argument('--point_num', type=int, default=4096, help='Point Number')
+parser.add_argument('--group_num', type=int, default=80, help='Maximum Group Number in one pc')
 parser.add_argument('--cate_num', type=int, default=13, help='Number of categories')
 parser.add_argument('--margin_same', type=float, default=10., help='Double hinge loss margin: same semantic')
 parser.add_argument('--margin_diff', type=float, default=80., help='Double hinge loss margin: different semantic')
 parser.add_argument('--dataset', type=str, default="s3dis", help='Dataset to use [default: s3dis]')
 
 # Input&Output Settings
-parser.add_argument('--output_dir', type=str, default='checkpoint/stanford_sem_seg', help='Directory that stores all training logs and trained models')
+parser.add_argument('--output_dir', type=str, default='stanford_sem_seg', help='Directory that stores all training logs and trained models')
 parser.add_argument('--restore_model', type=str, default='checkpoint/stanford_ins_seg', help='Pretrained model')
 
 FLAGS = parser.parse_args()
@@ -41,7 +42,7 @@ PRETRAINED_MODEL_PATH = os.path.join(FLAGS.restore_model, 'trained_models/')
 
 POINT_NUM = FLAGS.point_num
 BATCH_SIZE = FLAGS.batch
-OUTPUT_DIR = FLAGS.output_dir
+OUTPUT_DIR = os.path.join('checkpoint', FLAGS.output_dir)
 
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
@@ -86,8 +87,8 @@ os.system('cp %s %s' % (os.path.join(BASE_DIR, 'train.py'), LOG_DIR))  # bkp of 
 DATA_PATH = os.path.join(BASE_DIR, 'data', FLAGS.dataset)
 print('Use virtual scan data')
 
-# train_batch, init_op = provider.scannet_dataset(root=DATA_PATH, npoints=NUM_POINT, split='train', whole=FLAGS.whole, dataset=FLAGS.dataset)
-TRAIN_DATASET = provider.VirtualScanDataset(root=DATA_PATH, npoints=NUM_POINT, split='train', dataset=FLAGS.dataset)
+# train_batch, init_op = provider.scannet_dataset(root=DATA_PATH, npoints=POINT_NUM, split='train', whole=FLAGS.whole, dataset=FLAGS.dataset)
+TRAIN_DATASET = provider.VirtualScanDataset(root=DATA_PATH, npoints=POINT_NUM, split='train', dataset=FLAGS.dataset)
 
 
 def printout(flog, data):
@@ -97,20 +98,20 @@ def printout(flog, data):
 
 def get_batch_wdp(dataset, idxs):
     bsize = len(idxs)
-    batch_data = np.zeros((bsize, POINT_NUM, 3))
-    batch_label = np.zeros((bsize, POINT_NUM), dtype=np.int32)
-    batch_smpw = np.zeros((bsize, POINT_NUM), dtype=np.float32)
+    batch_data = np.zeros((bsize, POINT_NUM, 9), dtype=np.float32)
+    batch_group = np.zeros((bsize, POINT_NUM), dtype=np.int8)
+    batch_seg = np.zeros((bsize, POINT_NUM), dtype=np.int8)
     for i, idx in enumerate(idxs):
         data_idx, view_idx = idx
         while True:
-            try:
-                data, group, seg = dataset[(data_idx, view_idx)]
-                break
-            except:
-                old_data_idx, old_view_idx = data_idx, view_idx
-                data_idx = np.random.randint(len(dataset))
-                view_idx = np.random.randint(8)
-                print('Data-{} from view-{} is invalid. Instead, use data-{} from view-{}'.format(old_data_idx, old_view_idx, data_idx, view_idx))
+            # try:
+            data, group, seg = dataset[(data_idx, view_idx)]
+            break
+            # except:
+            #     old_data_idx, old_view_idx = data_idx, view_idx
+            #     data_idx = np.random.randint(len(dataset))
+            #     view_idx = np.random.randint(8)
+            #     print('Data-{} from view-{} is invalid. Instead, use data-{} from view-{}'.format(old_data_idx, old_view_idx, data_idx, view_idx))
 
         batch_data[i,...] = data
         batch_group[i,:] = group
@@ -190,10 +191,6 @@ def train():
         else:
             printout(flog, "Fail to load modelfile: %s" % PRETRAINED_MODEL_PATH)
 
-
-        train_file_idx = np.arange(0, len(train_file_list))
-        np.random.shuffle(train_file_idx)
-
         num_data = len(TRAIN_DATASET) * 8
         num_batch = num_data // BATCH_SIZE
 
@@ -229,7 +226,6 @@ def train():
                     is_training_ph: is_training,
                     alpha_ph: min(10., (float(epoch_num) / 5.) * 2. + 2.),
                 }
-
                 _, loss_val, simmat_val, grouperr_val, same_val, same_cnt_val, diff_val, diff_cnt_val, pos_val, pos_cnt_val = sess.run([train_op, loss, net_output['simmat'], grouperr, same, same_cnt, diff, diff_cnt, pos, pos_cnt], feed_dict=feed_dict)
                 total_loss += loss_val
                 total_grouperr += grouperr_val
@@ -259,9 +255,6 @@ def train():
                     total_pos = 0.0
                     same_cnt0 = 0
 
-            cp_filename = saver.save(sess,
-                                     os.path.join(MODEL_STORAGE_PATH, 'epoch_' + str(epoch_num + 1) + '.ckpt'))
-            printout(flog, 'Successfully store the checkpoint model into ' + cp_filename)
 
         if not os.path.exists(MODEL_STORAGE_PATH):
             os.mkdir(MODEL_STORAGE_PATH)
@@ -269,15 +262,13 @@ def train():
         for epoch in range(TRAINING_EPOCHES):
             printout(flog, '\n>>> Training for the epoch %d/%d ...' % (epoch, TRAINING_EPOCHES))
 
-            train_file_idx = np.arange(0, len(train_file_list))
-            np.random.shuffle(train_file_idx)
-
             train_one_epoch(epoch)
             flog.flush()
 
-            cp_filename = saver.save(sess,
+            if epoch % 10 == 0:
+                cp_filename = saver.save(sess,
                                      os.path.join(MODEL_STORAGE_PATH, 'epoch_' + str(epoch + 1) + '.ckpt'))
-            printout(flog, 'Successfully store the checkpoint model into ' + cp_filename)
+                printout(flog, 'Successfully store the checkpoint model into ' + cp_filename)
 
 
         flog.close()

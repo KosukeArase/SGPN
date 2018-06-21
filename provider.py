@@ -2,6 +2,66 @@ import os
 import sys
 import numpy as np
 import h5py
+import pickle
+from sklearn.neighbors import NearestNeighbors
+from numpy import linalg as la
+import scipy.io as sio
+
+
+def cart2sph(xyz):
+    xy = xyz[:,0]**2+xyz[:,1]**2
+    aer = np.zeros(xyz.shape)
+    aer[:,2] = np.sqrt(xy+xyz[:,2]**2)
+    aer[:,1] = np.arctan2(xyz[:,2],np.sqrt(xy))
+    aer[:,0] = np.arctan2(xyz[:,1],xyz[:,0])
+    return aer
+
+
+# generate virtual scan of a scene by subsampling the point cloud
+def virtual_scan(xyz, mode=-1):
+    camloc = np.mean(xyz,axis=0)
+    camloc[2] = 1.5 # human height
+    if mode==-1:
+        view_dr = np.array([2*np.pi*np.random.random(), np.pi/10*(np.random.random()-0.75)])
+        camloc[:2] -= (0.8+0.7*np.random.random())*np.array([np.cos(view_dr[0]),np.sin(view_dr[0])])
+    else:
+        view_dr = np.array([np.pi/4*mode, 0])
+        camloc[:2] -= np.array([np.cos(view_dr[0]),np.sin(view_dr[0])])
+    ct_ray_dr = np.array([np.cos(view_dr[1])*np.cos(view_dr[0]), np.cos(view_dr[1])*np.sin(view_dr[0]), np.sin(view_dr[1])])
+    hr_dr = np.cross(ct_ray_dr, np.array([0,0,1]))
+    hr_dr /= la.norm(hr_dr)
+    vt_dr = np.cross(hr_dr, ct_ray_dr)
+    vt_dr /= la.norm(vt_dr)
+    xx = np.linspace(-0.6,0.6,200) #200
+    yy = np.linspace(-0.45,0.45,150) #150
+    xx, yy = np.meshgrid(xx,yy)
+    xx = xx.reshape(-1,1)
+    yy = yy.reshape(-1,1)
+    rays = xx*hr_dr.reshape(1,-1)+yy*vt_dr.reshape(1,-1)+ct_ray_dr.reshape(1,-1)
+    rays_aer = cart2sph(rays)
+    local_xyz = xyz-camloc.reshape(1,-1)
+    local_aer = cart2sph(local_xyz)
+    nbrs = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(rays_aer[:,:2])
+    mindd, minidx = nbrs.kneighbors(local_aer[:,:2])
+    mindd = mindd.reshape(-1)
+    minidx = minidx.reshape(-1)
+
+    sub_idx = mindd<0.01
+    if sum(sub_idx)<100:
+        return np.ones(0)
+    sub_r = local_aer[sub_idx,2]
+    sub_minidx = minidx[sub_idx]
+    min_r = float('inf')*np.ones(np.max(sub_minidx)+1)
+    for i in xrange(len(sub_r)):
+        if sub_r[i]<min_r[sub_minidx[i]]:
+            min_r[sub_minidx[i]] = sub_r[i]
+    sub_smpidx = np.ones(len(sub_r))
+    for i in xrange(len(sub_r)):
+        if sub_r[i]>min_r[sub_minidx[i]]:
+            sub_smpidx[i] = 0
+    smpidx = np.where(sub_idx)[0]
+    smpidx = smpidx[sub_smpidx==1]
+    return smpidx
 
 
 class VirtualScanDataset():
@@ -30,11 +90,12 @@ class VirtualScanDataset():
 
     def __create_smpidx(self):
         virtual_smpidx = list()
-        for point_set in self.scene_points_list[:, :, :3]: # pointset.shape = [points, 3]
+        for point_set in self.scene_points_list: # point_set.shape = [points, 6]
+            point_set = point_set[:, :3]
             assert point_set.shape[1] == 3
             smpidx = list()
             for i in xrange(8):
-                var = scene_util.virtual_scan(point_set, mode=i)
+                var = virtual_scan(point_set, mode=i)
                 smpidx.append(np.expand_dims(var, 0)) # 1xpoints
             virtual_smpidx.append(smpidx) # datax8xpoints
 
@@ -87,30 +148,34 @@ class VirtualScanDataset():
         instance_group = instance_group[choice]
         semantic_seg = semantic_seg[choice] # N
 
+        """
         xyz = point_set_ini[:, :3]
         camloc = np.mean(xyz,axis=0)
         camloc[2] = 1.5
         view_dr = np.array([np.pi/4.*view_ind, 0])
         camloc[:2] -= np.array([np.cos(view_dr[0]),np.sin(view_dr[0])])
         point_set[:, :2] -= camloc[:2]
+        """
 
         r_rotation = self.__get_rotation_matrix(-view_ind+1)
         rotated = point_set[:, :3].dot(r_rotation)
 
-        min_global_xyz, max_global_xyz = self.rotated_data_stats[data_ind, view_ind]
+        min_global_xyz, max_global_xyz = self.rotated_data_stats[data_ind][view_ind]
         min_local_xyz, max_local_xyz = np.min(rotated, axis=0), np.max(rotated, axis=0)
 
-        global_data = (rotated - min_global_xyz) / (max_global_xyz - min_global_xyz)
-        local_data = (rotated - min_local_xyz) / (max_local_xyz - min_local_xyz)
+        global_data = (rotated - min_global_xyz) / (max_global_xyz - min_global_xyz) # 0.0 ~ 1.0
+        local_data = (rotated - min_local_xyz) / (max_local_xyz - min_local_xyz) - 0.5 # xy: [-0.5, 0.5], z: [0. )
+        local_data[:, 2] = rotated[:, 2]
 
-        assert 0 <= np.min(global_data)
-        assert 1 >= np.max(global_data)
-        assert 0 <= np.min(local_data)
-        assert 1 >= np.max(local_data)
+        assert -0.05 <= np.min(global_data)
+        assert 1.05 >= np.max(global_data)
+        assert -0.55 <= np.min(local_data[:, :2])
+        assert 0.55 >= np.max(local_data[:, :2])
+        assert 1 < np.max(local_data[:, 2])
 
         assert local_data.shape == global_data.shape == point_set[:, 3:].shape
 
-        data = [local_data, point_set[:, 3:], global_data]
+        data = np.hstack([local_data, point_set[:, 3:], global_data])
 
         return data, instance_group, semantic_seg # , sample_weight
 
