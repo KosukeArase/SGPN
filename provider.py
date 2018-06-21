@@ -2,223 +2,130 @@ import os
 import sys
 import numpy as np
 import h5py
-# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# sys.path.append(BASE_DIR)
-#
-# # Download dataset for point cloud classification
-# DATA_DIR = os.path.join(BASE_DIR, 'data')
-# if not os.path.exists(DATA_DIR):
-#     os.mkdir(DATA_DIR)
-# if not os.path.exists(os.path.join(DATA_DIR, 'modelnet40_ply_hdf5_2048')):
-#     www = 'https://shapenet.cs.stanford.edu/media/modelnet40_ply_hdf5_2048.zip'
-#     zipfile = os.path.basename(www)
-#     os.system('wget %s; unzip %s' % (www, zipfile))
-#     os.system('mv %s %s' % (zipfile[:-4], DATA_DIR))
-#     os.system('rm %s' % (zipfile))
 
 
-def shuffle_data(data, labels):
-    """ Shuffle data and labels.
-        Input:
-          data: B,N,... numpy array
-          label: B,... numpy array
-        Return:
-          shuffled data, label and shuffle indices
-    """
-    idx = np.arange(len(labels))
-    np.random.shuffle(idx)
-    return data[idx, ...], labels[idx], idx
+class VirtualScanDataset():
+    def __init__(self, root, npoints=8192, split='train', dataset='scannet'):
+        self.npoints = npoints
+        self.root = root
+        self.split = split
+        self.data_filename = os.path.join(self.root, '{}_{}.pickle'.format(dataset, split))
+        self.smpidx_filename = os.path.join(self.root, '{}_{}_smpidx.pickle'.format(dataset, split))
+        with open(self.data_filename,'rb') as fp:
+            self.scene_points_list = pickle.load(fp) # [data, point, XYZRGB] -> original XYZ and normalized RGB
+            self.instance_group_list = pickle.load(fp) # [data, point] -> 0 ~ n_instances
+            self.semantic_labels_list = pickle.load(fp) # [data, point] -> 0 ~ n_classes
+            self.rotated_data_stats = pickle.load(fp) # [data, view] -> [[min(X), max(X)], [min(Y), max(Y)], [min(Z), max(Z)]]
+
+        if os.path.exists(self.smpidx_filename):
+            print('Start Loading indexes for virtual scan.')
+            with open(self.smpidx_filename, 'rb') as fp:
+                self.virtual_smpidx = pickle.load(fp)
+            print('End Loading indexes for virtual scan.')
+        else:
+            print('Start creating indexes for virtual scan.')
+            self.virtual_smpidx = self.__create_smpidx()
+            print('End creating indexes for virtual scan.')
 
 
-def rotate_point_cloud(batch_data):
-    """ Randomly rotate the point clouds to augument the dataset
-        rotation is per shape based along up direction
-        Input:
-          BxNx3 array, original batch of point clouds
-        Return:
-          BxNx3 array, rotated batch of point clouds
-    """
-    rotated_data = np.zeros(batch_data.shape, dtype=np.float32)
-    for k in range(batch_data.shape[0]):
-        rotation_angle = np.random.uniform() * 2 * np.pi
-        cosval = np.cos(rotation_angle)
-        sinval = np.sin(rotation_angle)
-        rotation_matrix = np.array([[cosval, 0, sinval],
-                                    [0, 1, 0],
-                                    [-sinval, 0, cosval]])
-        shape_pc = batch_data[k, ...]
-        rotated_data[k, ...] = np.dot(shape_pc.reshape((-1, 3)), rotation_matrix)
-    return rotated_data
+    def __create_smpidx(self):
+        virtual_smpidx = list()
+        for point_set in self.scene_points_list[:, :, :3]: # pointset.shape = [points, 3]
+            assert point_set.shape[1] == 3
+            smpidx = list()
+            for i in xrange(8):
+                var = scene_util.virtual_scan(point_set, mode=i)
+                smpidx.append(np.expand_dims(var, 0)) # 1xpoints
+            virtual_smpidx.append(smpidx) # datax8xpoints
 
+        assert len(virtual_smpidx) == len(self.scene_points_list)
+        assert len(virtual_smpidx[0]) == 8
 
-def rotate_point_cloud_by_angle(batch_data, rotation_angle):
-    """ Rotate the point cloud along up direction with certain angle.
-        Input:
-          BxNx3 array, original batch of point clouds
-        Return:
-          BxNx3 array, rotated batch of point clouds
-    """
-    rotated_data = np.zeros(batch_data.shape, dtype=np.float32)
-    for k in range(batch_data.shape[0]):
-        #rotation_angle = np.random.uniform() * 2 * np.pi
-        cosval = np.cos(rotation_angle)
-        sinval = np.sin(rotation_angle)
-        rotation_matrix = np.array([[cosval, 0, sinval],
-                                    [0, 1, 0],
-                                    [-sinval, 0, cosval]])
-        shape_pc = batch_data[k, ...]
-        rotated_data[k, ...] = np.dot(shape_pc.reshape((-1, 3)), rotation_matrix)
-    return rotated_data
+        with open(self.smpidx_filename,'wb') as fp:
+            pickle.dump(virtual_smpidx, fp)
 
+        return virtual_smpidx
 
-def jitter_point_cloud(batch_data, sigma=0.01, clip=0.05):
-    """ Randomly jitter points. jittering is per point.
-        Input:
-          BxNx3 array, original batch of point clouds
-        Return:
-          BxNx3 array, jittered batch of point clouds
-    """
-    B, N, C = batch_data.shape
-    assert(clip > 0)
-    jittered_data = np.clip(sigma * np.random.randn(B, N, C), -1*clip, clip)
-    jittered_data += batch_data
-    return jittered_data
+    def __get_rotation_matrix(self, i):
+        theta = (i-4)*np.pi/4.0    # Rotation about the pole (Z).
+        phi = 0 #phi * 2.0 * np.pi     # For direction of pole deflection.
+        z = 0 # z * 2.0 * deflection    # For magnitude of pole deflection.
 
+        r = np.sqrt(z)
+        V = (
+            np.sin(phi) * r,
+            np.cos(phi) * r,
+            np.sqrt(2.0 - z))
 
-def save_h5_output(h5_filename, seg, segrefine, group, grouppred, label_dtype='uint8'):
-    print h5_filename
-    h5_fout = h5py.File(h5_filename)
-    h5_fout.create_dataset(
-            'seglabel', data=seg,
-            compression='gzip', compression_opts=1,
-            dtype=label_dtype)
-    h5_fout.create_dataset(
-            'segrefine', data=segrefine,
-            compression='gzip', compression_opts=1,
-            dtype=label_dtype)
-    h5_fout.create_dataset(
-            'pid', data=group,
-            compression='gzip', compression_opts=1,
-            dtype=label_dtype)
-    h5_fout.create_dataset(
-            'predpid', data=grouppred,
-            compression='gzip', compression_opts=1,
-            dtype=label_dtype)
-    h5_fout.close()
+        st = np.sin(theta)
+        ct = np.cos(theta)
 
-def getDataFiles(list_filename):
-    return [line.rstrip() for line in open(list_filename)]
+        R = np.array(((ct, st, 0), (-st, ct, 0), (0, 0, 1)))
 
-def load_h5(h5_filename):
-    f = h5py.File(h5_filename)
-    data = f['data'][:]
-    label = f['label'][:]
-    return (data, label)
+        # Construct the rotation matrix  ( V Transpose(V) - I ) R.
+        M = (np.outer(V, V) - np.eye(3)).dot(R)
+        return M
 
-def loadDataFile(filename):
-    return load_h5(filename)
+    def __getitem__(self, inds):
+        data_ind, view_ind = inds
+        point_set_ini = self.scene_points_list[data_ind]
+        instance_group_ini = self.instance_group_list[data_ind].astype(np.int32)
+        semantic_seg_ini = self.semantic_labels_list[data_ind].astype(np.int32)
 
-def load_h5_data_label_seg(h5_filename):
-    f = h5py.File(h5_filename)
-    data = f['data'][:]
-    label = f['label'][:]
-    seg = f['pid'][:]
-    return (data, label, seg)
+        assert len(self.virtual_smpidx[data_ind]) == 8
 
+        smpidx = self.virtual_smpidx[data_ind][view_ind][0]
+        if len(smpidx) < (self.npoints/4.):
+            raise ValueError('Data-{} from view-{} is invalid.'.format(data_ind, view_ind))
 
-def loadDataFile_with_seg(filename):
-    return load_h5_data_label_seg(filename)
+        point_set = point_set_ini[smpidx,:] # (global)XYZRGB
+        instance_group = instance_group_ini[smpidx]
+        semantic_seg = semantic_seg_ini[smpidx]
 
-def loadDataFile_with_grouplabel(filename):
-    f = h5py.File(filename)
-    data = f['data'][:]
-    # label = f['label'][:]
-    group = f['pid'][:]#Nx1
-    if 'groupcategory' in f:
-        cate = f['groupcategory'][:]#Gx1
-    else:
-        cate = 0
-    return (data, group, cate)
+        choice = np.random.choice(len(semantic_seg), self.npoints, replace=True)
+        point_set = point_set[choice,:] # Nx6, global XYZ
+        instance_group = instance_group[choice]
+        semantic_seg = semantic_seg[choice] # N
 
-def loadDataFile_with_groupseglabel(filename):
-    f = h5py.File(filename)
-    data = f['data'][:]
-    # label = f['label'][:]
-    group = f['pid'][:]#Nx1
-    if 'groupcategory' in f:
-        cate = f['groupcategory'][:]#Gx1
-    else:
-        cate = 0
-    seg = -1 * np.ones_like(group)
-    for i in range(group.shape[0]):
-        for j in range(group.shape[1]):
-            if group[i,j,0]!=-1 and cate[i,group[i,j,0],0]!=-1:
-                    seg[i,j,0] = cate[i,group[i,j,0],0]
-    return (data, group, cate, seg)
+        xyz = point_set_ini[:, :3]
+        camloc = np.mean(xyz,axis=0)
+        camloc[2] = 1.5
+        view_dr = np.array([np.pi/4.*view_ind, 0])
+        camloc[:2] -= np.array([np.cos(view_dr[0]),np.sin(view_dr[0])])
+        point_set[:, :2] -= camloc[:2]
 
-def loadDataFile_with_groupseglabel_sunrgbd(filename):
-    f = h5py.File(filename)
-    data = f['data'][:]
-    group = f['pid'][:]#NxG
-    if 'groupcategory' in f:
-        cate = f['groupcategory'][:]#Gx1
-    else:
-        cate = 0
-    if 'seglabel' in f:
-        seg = f['seglabel'][:]
-    else:
-        seg = f['seglabels'][:]
-    return (data, group, cate, seg)
+        r_rotation = self.__get_rotation_matrix(-view_ind+1)
+        rotated = point_set[:, :3].dot(r_rotation)
 
-def loadDataFile_with_groupseglabel_scannet(filename):
-    f = h5py.File(filename)
-    data = f['data'][:]
-    # label = f['label'][:]
-    group = f['pid'][:]#NxG
-    if 'groupcategory' in f:
-        cate = f['groupcategory'][:]#Gx1
-    else:
-        cate = 0
-    if 'seglabel' in f:
-        seg = f['seglabel'][:]
-    else:
-        seg = f['seglabels'][:]
-    return (data, group, cate, seg)
+        min_global_xyz, max_global_xyz = self.rotated_data_stats[data_ind, view_ind]
+        min_local_xyz, max_local_xyz = np.min(rotated, axis=0), np.max(rotated, axis=0)
 
+        global_data = (rotated - min_global_xyz) / (max_global_xyz - min_global_xyz)
+        local_data = (rotated - min_local_xyz) / (max_local_xyz - min_local_xyz)
 
-def loadDataFile_with_groupseglabel_nuyv2(filename):
-    f = h5py.File(filename)
-    data = f['data'][:]
-    group = f['pid'][:]#NxG
-    if 'groupcategory' in f:
-        cate = f['groupcategory'][:]#Gx1
-    else:
-        cate = 0
-    if 'seglabel' in f:
-        seg = f['seglabel'][:]
-    else:
-        seg = f['seglabels'][:]
-    boxes = f['bbox'][:]
-    return (data, group, cate, seg, boxes)
+        assert 0 <= np.min(global_data)
+        assert 1 >= np.max(global_data)
+        assert 0 <= np.min(local_data)
+        assert 1 >= np.max(local_data)
 
-def loadDataFile_with_groupseglabel_stanfordindoor(filename):
-    f = h5py.File(filename)
-    data = f['data'][:]
-    group = f['pid'][:].astype(np.int32)#NxG
-    if 'label' in f:
-        label = f['label'][:].astype(np.int32)
-    else :
-        label = []
-    if 'seglabel' in f:
-        seg = f['seglabel'][:].astype(np.int32)
-    else:
-        seg = f['seglabels'][:].astype(np.int32)
-    return (data, group, label, seg)
+        assert local_data.shape == global_data.shape == point_set[:, 3:].shape
 
-def loadDataFile_with_img(filename):
-    f = h5py.File(filename)
-    data = f['data'][:]
-    group = f['pid'][:]#NxG
-    seg = f['seglabel'][:]
-    img = f['img'][:].transpose([2,1,0])
-    return (data, group, seg, img)
+        data = [local_data, point_set[:, 3:], global_data]
+
+        return data, instance_group, semantic_seg # , sample_weight
+
+    # def get_batch(root, npoints=8192, split='train', whole=False):
+    #     dataset = tf.data.Dataset.from_tensor_slices((self.scene_points_list, self.semantic_labels_list, self.smpidx)) # dataset
+    #     dataset = dataset.repeat()
+    #     dataset = dataset.shuffle(1000)
+    #     dataset = dataset.map(virtual_scan, num_parallel_calls=num_threads).prefetch(batch_size*3) # augment
+    #     dataset = dataset.batch(batch_size)
+    #     dataset = dataset.shuffle(batch_size*3)
+    #     iterator = tf.data.Iterator.from_structure(dataset.output_types, dataset.output_shapes)
+    #     next_element = iterator.get_next()
+    #     init_op = iterator.make_initializer(dataset)
+
+    #     return next_element, init_op
+
+    def __len__(self):
+        return len(self.scene_points_list)

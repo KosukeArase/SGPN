@@ -22,22 +22,21 @@ parser.add_argument('--gpu', type=str, default="1", help='GPU to use [default: G
 parser.add_argument('--wd', type=float, default=0.9, help='Weight Decay [Default: 0.0]')
 parser.add_argument('--epoch', type=int, default=200, help='Number of epochs [default: 50]')
 parser.add_argument('--batch', type=int, default=4, help='Batch Size during training [default: 4]')
-parser.add_argument('--point_num', type=int, default=4096, help='Point Number')
+parser.add_argument('--point_num', type=int, default=8192, help='Point Number')
 parser.add_argument('--group_num', type=int, default=50, help='Maximum Group Number in one pc')
 parser.add_argument('--cate_num', type=int, default=13, help='Number of categories')
 parser.add_argument('--margin_same', type=float, default=10., help='Double hinge loss margin: same semantic')
 parser.add_argument('--margin_diff', type=float, default=80., help='Double hinge loss margin: different semantic')
+parser.add_argument('--dataset', type=str, default="s3dis", help='Dataset to use [default: s3dis]')
 
 # Input&Output Settings
 parser.add_argument('--output_dir', type=str, default='checkpoint/stanford_sem_seg', help='Directory that stores all training logs and trained models')
-parser.add_argument('--input_list', type=str, default='data/train_hdf5_file_list.txt', help='Input data list file')
 parser.add_argument('--restore_model', type=str, default='checkpoint/stanford_ins_seg', help='Pretrained model')
 
 FLAGS = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = FLAGS.gpu
 
-TRAINING_FILE_LIST = FLAGS.input_list
 PRETRAINED_MODEL_PATH = os.path.join(FLAGS.restore_model, 'trained_models/')
 
 POINT_NUM = FLAGS.point_num
@@ -84,9 +83,41 @@ if not os.path.exists(LOG_DIR): os.mkdir(LOG_DIR)
 os.system('cp %s %s' % (os.path.join(BASE_DIR, 'models/model.py'), LOG_DIR))  # bkp of model def
 os.system('cp %s %s' % (os.path.join(BASE_DIR, 'train.py'), LOG_DIR))  # bkp of train procedure
 
+DATA_PATH = os.path.join(BASE_DIR, 'data', FLAGS.dataset)
+print('Use virtual scan data')
+
+# train_batch, init_op = provider.scannet_dataset(root=DATA_PATH, npoints=NUM_POINT, split='train', whole=FLAGS.whole, dataset=FLAGS.dataset)
+TRAIN_DATASET = provider.VirtualScanDataset(root=DATA_PATH, npoints=NUM_POINT, split='train', dataset=FLAGS.dataset)
+
+
 def printout(flog, data):
     print(data)
     flog.write(data + '\n')
+
+
+def get_batch_wdp(dataset, idxs):
+    bsize = len(idxs)
+    batch_data = np.zeros((bsize, POINT_NUM, 3))
+    batch_label = np.zeros((bsize, POINT_NUM), dtype=np.int32)
+    batch_smpw = np.zeros((bsize, POINT_NUM), dtype=np.float32)
+    for i, idx in enumerate(idxs):
+        data_idx, view_idx = idx
+        while True:
+            try:
+                data, group, seg = dataset[(data_idx, view_idx)]
+                break
+            except:
+                old_data_idx, old_view_idx = data_idx, view_idx
+                data_idx = np.random.randint(len(dataset))
+                view_idx = np.random.randint(8)
+                print('Data-{} from view-{} is invalid. Instead, use data-{} from view-{}'.format(old_data_idx, old_view_idx, data_idx, view_idx))
+
+        batch_data[i,...] = data
+        batch_group[i,:] = group
+        batch_seg[i,:] = seg
+
+    return batch_data, batch_group, batch_seg
+
 
 def train():
     with tf.Graph().as_default():
@@ -145,9 +176,6 @@ def train():
 
         train_writer = tf.summary.FileWriter(SUMMARIES_FOLDER + '/train', sess.graph)
 
-        train_file_list = provider.getDataFiles(TRAINING_FILE_LIST)
-        num_train_file = len(train_file_list)
-
         fcmd = open(os.path.join(LOG_STORAGE_PATH, 'cmd.txt'), 'w')
         fcmd.write(str(FLAGS))
         fcmd.close()
@@ -166,31 +194,14 @@ def train():
         train_file_idx = np.arange(0, len(train_file_list))
         np.random.shuffle(train_file_idx)
 
-        ## load all data into memory
-        all_data = []
-        all_group = []
-        all_seg = []
-        for i in range(num_train_file):
-            cur_train_filename = train_file_list[train_file_idx[i]]
-            # printout(flog, 'Loading train file ' + cur_train_filename)
-            cur_data, cur_group, _, cur_seg = provider.loadDataFile_with_groupseglabel_stanfordindoor(cur_train_filename)
-            all_data += [cur_data]
-            all_group += [cur_group]
-            all_seg += [cur_seg]
-
-        all_data = np.concatenate(all_data,axis=0)
-        all_group = np.concatenate(all_group,axis=0)
-        all_seg = np.concatenate(all_seg,axis=0)
-
-        num_data = all_data.shape[0]
+        num_data = len(TRAIN_DATASET) * 8
         num_batch = num_data // BATCH_SIZE
 
         def train_one_epoch(epoch_num):
-
             ### NOTE: is_training = False: We do not update bn parameters during training due to the small batch size. This requires pre-training PointNet with large batchsize (say 32).
             is_training = False
 
-            order = np.arange(num_data)
+            order = list([x for x in itertools.product(range(len(TRAIN_DATASET)), range(8))])
             np.random.shuffle(order)
 
             total_loss = 0.0
@@ -204,11 +215,13 @@ def train():
                 begidx = j * BATCH_SIZE
                 endidx = (j + 1) * BATCH_SIZE
 
-                pts_label_one_hot, pts_label_mask = model.convert_seg_to_one_hot(all_seg[order[begidx: endidx]])
-                pts_group_label, pts_group_mask = model.convert_groupandcate_to_one_hot(all_group[order[begidx: endidx]])
+                batch_data, batch_group, batch_seg = get_batch_wdp(TRAIN_DATASET, order[begidx: endidx])
+
+                pts_label_one_hot, pts_label_mask = model.convert_seg_to_one_hot(batch_seg)
+                pts_group_label, pts_group_mask = model.convert_groupandcate_to_one_hot(batch_group)
 
                 feed_dict = {
-                    pointclouds_ph: all_data[order[begidx: endidx], ...],
+                    pointclouds_ph: batch_data,
                     ptsseglabel_ph: pts_label_one_hot,
                     ptsgroup_label_ph: pts_group_label,
                     pts_seglabel_mask_ph: pts_label_mask,
@@ -245,8 +258,6 @@ def train():
                     total_same = 0.0
                     total_pos = 0.0
                     same_cnt0 = 0
-
-
 
             cp_filename = saver.save(sess,
                                      os.path.join(MODEL_STORAGE_PATH, 'epoch_' + str(epoch_num + 1) + '.ckpt'))
